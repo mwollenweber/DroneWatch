@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Poll the public NOPD drone flight layer and tweet each new flight.
+
+Parameters:
+  PollMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 2
+    Description: How often to poll the NOPD layer, in minutes.
+  MaxTweetsPerRun:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Most tweets per run; extra new flights wait for the next run.
+  FloodThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: If more new flights than this appear at once, tweet nothing and log an error.
+  DryRun:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Log tweets instead of posting them.
+
+Resources:
+  Flights:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: flight_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: flight_id
+          KeyType: HASH
+
+  XCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/x-credentials"
+      Description: X API OAuth 1.0a user credentials with Read and Write permission.
+      # placeholder; fill with `aws secretsmanager put-secret-value` after deploy
+      SecretString: '{"api_key":"","api_secret":"","access_token":"","access_token_secret":""}'
+
+  PollerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/poller"
+      RetentionInDays: 90
+
+  Poller:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Runtime: python3.14
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 90
+      LoggingConfig:
+        LogGroup: !Ref PollerLogs
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Flights
+          SECRET_ID: !Ref XCredentials
+          MAX_TWEETS_PER_RUN: !Ref MaxTweetsPerRun
+          FLOOD_THRESHOLD: !Ref FloodThreshold
+          DRY_RUN: !Ref DryRun
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Flights
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref XCredentials
+      # a failed run is retried by the next scheduled run, not by Lambda
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Events:
+        Poll:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub "rate(${PollMinutes} minutes)"
+
+Outputs:
+  FunctionName:
+    Value: !Ref Poller
+  TableName:
+    Value: !Ref Flights
+  SecretArn:
+    Value: !Ref XCredentials
+  LogGroup:
+    Value: !Ref PollerLogs
