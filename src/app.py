@@ -21,7 +21,7 @@ Event overrides: {"dry_run": true} logs tweets without posting them;
 python app.py --preview 5
 
 # run the monitor locally: same new-flight detection, but the "already handled"
-# set lives in a JSON file and new flights are printed instead of tweeted
+# set lives in a JSON file and each new flight is printed as JSON, not tweeted
 python app.py --watch --every 15
 
 Copyright 2026 mjw@insomniac.tech
@@ -181,13 +181,33 @@ class LocalStore:
         tmp.replace(self.path)
 
 
-def print_post(text):
-    """Stand-in for X.post in --watch: prints the tweet instead of sending it.
+def flight_details(a, center=None, text=None):
+    """A flight's attributes as a readable dict, for --watch output."""
+    local = lambda ms: datetime.fromtimestamp(ms / 1000, LOCAL).isoformat(timespec="seconds")
+    d = {"flight_id": a["flight_id"], "object_id": a["ObjectId"],
+         "purpose": a.get("flight_purpose"), "description": a.get("description"),
+         "external_id": a.get("external_id"),
+         "takeoff": local(a["takeoff"]),
+         "landing": local(a["landing"]) if a.get("landing") else None,
+         "duration_min": (round((a["landing"] - a["takeoff"]) / 60000)
+                          if a.get("landing") else None),
+         "lat": round(center[0], 5) if center else None,
+         "lon": round(center[1], 5) if center else None,
+         "vehicle_serial": a.get("vehicle_serial"), "dock_serial": a.get("dock_serial"),
+         "operation_id": a.get("operation_id")}
+    if text:
+        d["tweet"] = text
+    return d
+
+
+def print_post(text, flight=None, center=None):
+    """Stand-in for X.post in --watch: prints the flight as JSON, sends nothing.
 
     Returns "stdout" where X.post returns a tweet id, so the record says where
     the flight went.
     """
-    print(text, end="\n\n", flush=True)
+    print(json.dumps(flight_details(flight, center, text), indent=2,
+                     ensure_ascii=False), flush=True)
     return "stdout"
 
 
@@ -207,7 +227,8 @@ class X:
                                 c["access_token"], c["access_token_secret"])
         return self._auth
 
-    def post(self, text):
+    def post(self, text, flight=None, center=None):
+        # flight and center are for print_post; X only needs the text
         r = self.session.post(TWEET_URL, json={"text": text}, auth=self.auth(),
                               timeout=30)
         if r.status_code == 429:
@@ -240,12 +261,13 @@ def run(store, post, session, *, seed=False, dry_run=False,
         return {**summary, "flood": True}
 
     for i, a in enumerate(new[:max_tweets]):
-        text = compose(a, flight_center(a["ObjectId"], session))
+        center = flight_center(a["ObjectId"], session)
+        text = compose(a, center)
         if dry_run:
             log.info("DRY RUN, would tweet %s:\n%s", a["flight_id"], text)
             continue
         try:
-            tweet_id = post(text)
+            tweet_id = post(text, flight=a, center=center)
         except RateLimited as exc:
             log.warning("rate limited (%s); %d flights left for the next run",
                         exc, len(new) - i)
