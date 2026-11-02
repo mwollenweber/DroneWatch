@@ -73,11 +73,107 @@ Logs go to the `/nopd-drone-tweets/poller` log group. If any tweet fails, the ru
 ends with an error, so an alarm on the function's `Errors` metric will catch
 broken credentials.
 
-## Local
+## Usage
+
+Everything below runs on your machine against the public layer and needs no
+AWS or X credentials. Deploying the Lambda is covered under [Setup](#setup).
 
 ```bash
-pip install -r src/requirements.txt boto3 pytest
-python src/app.py --preview 5     # tweet text for the 5 latest flights, no credentials needed
+pip install -r requirements-dev.txt
+python src/app.py --help
+```
+
+The script has two modes, one of which is required:
+
+| Mode | What it does |
+|---|---|
+| `--preview N` | Print the tweet text for the N latest flights and exit. No state is kept. |
+| `--watch` | Run the monitor locally: find flights not seen before, print each as JSON, remember them. |
+
+### Preview the latest flights
+
+```bash
+python src/app.py --preview 3
+```
+
+```
+NOPD drone flight: Training
+Tue Oct 20, 2026, 3:21–3:29 PM (9 min)
+https://www.google.com/maps/search/?api=1&query=29.95315,-90.06911
+
+NOPD drone flight: Tactical Operations
+“Swat Roll”
+Wed Sep 16, 2026, 4:46–4:57 PM (11 min)
+Item #I-16149-26
+https://www.google.com/maps/search/?api=1&query=29.95578,-90.01414
+...
+```
+
+### Run the monitor without X
+
+`--watch` runs the same new-flight detection as the Lambda, but keeps the
+"already handled" set in a local JSON file instead of DynamoDB and prints each
+new flight to stdout as a pretty JSON object instead of tweeting it. Nothing is
+sent anywhere.
+
+```bash
+python src/app.py --watch                 # one pass; the first pass only seeds the file
+python src/app.py --watch --every 15      # keep polling every 15 minutes (Ctrl-C to stop)
+python src/app.py --watch --state ~/flights.json --max-tweets 50
+python src/app.py --watch 2>/dev/null     # flights only; progress logs go to stderr
+python src/app.py --watch --every 1 2>/dev/null | jq -r .tweet   # just the tweet text
+```
+
+| Option | Default | Stands in for |
+|---|---|---|
+| `--state FILE` | `nopd-flights.json` | the DynamoDB table |
+| `--every MINUTES` | one pass, then exit | the `PollMinutes` schedule |
+| `--seed` | off | invoking with `{"seed": true}` |
+| `--max-tweets N` | 10 | `MaxTweetsPerRun` |
+| `--flood-threshold N` | 50 | `FloodThreshold` |
+
+A typical first session:
+
+```
+$ python src/app.py --watch
+08:35:33 INFO watching with state in nopd-flights.json
+08:35:33 INFO seeded 456 flights without tweeting
+08:35:33 INFO pass done: {"flights": 456, "seen": 0, "new": 456, "tweeted": 0, "failed": 0, "seeded": 456}
+
+$ python src/app.py --watch --every 1       # later, after NOPD uploads a batch
+08:50:34 INFO watching with state in nopd-flights.json
+{
+  "flight_id": "a61c65a5-e1ac-4040-88ed-5da0199a7dbe",
+  "object_id": 427,
+  "purpose": "Training",
+  "description": null,
+  "external_id": null,
+  "takeoff": "2026-10-20T15:21:16-05:00",
+  "landing": "2026-10-20T15:29:51-05:00",
+  "duration_min": 9,
+  "lat": 29.95315,
+  "lon": -90.06911,
+  "vehicle_serial": null,
+  "dock_serial": null,
+  "operation_id": null,
+  "tweet": "NOPD drone flight: Training\nTue Oct 20, 2026, 3:21–3:29 PM (9 min)\nhttps://www.google.com/maps/search/?api=1&query=29.95315,-90.06911"
+}
+08:50:34 INFO tweeted a61c65a5-e1ac-4040-88ed-5da0199a7dbe as stdout
+08:50:34 INFO summary {"flights": 457, "seen": 456, "new": 1, "tweeted": 1, "failed": 0}
+```
+
+Times are New Orleans local. `lat`/`lon` is the center of the flight path's
+bounding box, and `tweet` is the exact text the Lambda would have posted.
+
+The seeding, flood guard and per-pass cap behave exactly as deployed, so what
+you see locally is what the Lambda would tweet. The state file holds the same
+records as the table, keyed by `flight_id`; delete a flight's entry to see it
+reported again on the next pass, or delete the file to start over (the next
+pass seeds again and prints nothing).
+
+### Tests
+
+```bash
 pytest
 ```
 

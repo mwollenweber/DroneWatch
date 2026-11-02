@@ -1,2 +1,3 @@
-requests>=2.32
-requests-oauthlib>=2.0
+# Lambda bundle. Exact pins so `sam build` is reproducible; Dependabot bumps them.
+requests==2.34.2
+requests-oauthlib==2.0.0

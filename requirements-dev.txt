@@ -1,0 +1,4 @@
+# Local development: the Lambda's deps plus what tests and the AWS client need.
+-r src/requirements.txt
+boto3==1.43.123
+pytest==9.2.0
