@@ -332,7 +332,7 @@ def main():
                    help="print nothing if more new flights than this appear at "
                         "once, like FloodThreshold (default: %(default)s)")
     args = p.parse_args()
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, datefmt="%H:%M:%S",
                         format="%(asctime)s %(levelname)s %(message)s")
 
     if args.watch:
