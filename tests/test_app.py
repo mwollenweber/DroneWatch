@@ -1,3 +1,5 @@
+import argparse
+
 import pytest
 
 import app
@@ -134,3 +136,47 @@ def test_compose_crosses_midnight_and_sparse_fields():
     assert len(lines[1]) == app.DESC_MAX + 2 and lines[1].endswith("…”")
     assert lines[2] == "Wed Sep 16, 2026, 11:51 PM–12:14 AM (23 min)"
     assert len(lines) == 3
+
+
+def test_local_store_persists_like_the_table(tmp_path):
+    path = tmp_path / "flights.json"
+    store = app.LocalStore(path)
+    assert store.seen() == set()
+    store.record_all([flight(1), flight(2)], "seeded")
+    store.record(flight(3), "tweeted", "t0")
+
+    again = app.LocalStore(path)
+    assert again.seen() == {"f1", "f2", "f3"}
+    assert again.items["f3"]["tweet_id"] == "t0"
+    assert again.items["f1"]["status"] == "seeded" and "tweet_id" not in again.items["f1"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_local_store_rejects_wrong_shape(tmp_path):
+    path = tmp_path / "flights.json"
+    path.write_text("[]")
+    with pytest.raises(ValueError, match="keyed by flight_id"):
+        app.LocalStore(path)
+
+
+def test_watch_prints_new_flights_and_records_them(flights, tmp_path, capsys):
+    path = tmp_path / "flights.json"
+    flights += [flight(1), flight(2)]
+    app.run(app.LocalStore(path), app.print_post, None)  # first pass seeds
+    assert capsys.readouterr().out == ""
+
+    flights.append(flight(3))
+    out = app.run(app.LocalStore(path), app.print_post, None)
+    assert out["tweeted"] == 1
+    assert capsys.readouterr().out == app.compose(flight(3), (29.95578, -90.01415)) + "\n\n"
+    assert app.LocalStore(path).seen() == {"f1", "f2", "f3"}
+
+
+def test_watch_once_then_stops(flights, tmp_path, monkeypatch):
+    flights += [flight(1)]
+    calls = []
+    monkeypatch.setattr(app.time, "sleep", lambda s: calls.append(s))
+    args = argparse.Namespace(state=tmp_path / "s.json", every=0, seed=False,
+                              max_tweets=10, flood_threshold=50)
+    app.watch(args)
+    assert calls == [] and app.LocalStore(args.state).seen() == {"f1"}

@@ -20,11 +20,16 @@ Event overrides: {"dry_run": true} logs tweets without posting them;
 # preview tweet text for the 5 latest flights; needs no AWS or X credentials
 python app.py --preview 5
 
+# run the monitor locally: same new-flight detection, but the "already handled"
+# set lives in a JSON file and new flights are printed instead of tweeted
+python app.py --watch --every 15
+
 Copyright 2026 mjw@insomniac.tech
 """
 
-import argparse, json, logging, math, os
+import argparse, json, logging, math, os, sys, time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from requests_oauthlib import OAuth1
@@ -141,6 +146,51 @@ def _item(a, status, tweet_id=None):
     return item
 
 
+class LocalStore:
+    """JSON file of flights already handled; the local stand-in for DynamoDB.
+
+    Same records as the table, keyed by flight_id. Writes go through a temp
+    file so a crash mid-save can't leave a half-written file behind.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        try:
+            self.items = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self.items = {}
+        if not isinstance(self.items, dict):
+            raise ValueError(f"{self.path} should hold a JSON object keyed by flight_id")
+
+    def seen(self):
+        return set(self.items)
+
+    def record(self, a, status, tweet_id=None):
+        self.items[a["flight_id"]] = _item(a, status, tweet_id)
+        self._save()
+
+    def record_all(self, flights, status):
+        for a in flights:
+            self.items[a["flight_id"]] = _item(a, status)
+        self._save()
+
+    def _save(self):
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self.items, indent=1, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(self.path)
+
+
+def print_post(text):
+    """Stand-in for X.post in --watch: prints the tweet instead of sending it.
+
+    Returns "stdout" where X.post returns a tweet id, so the record says where
+    the flight went.
+    """
+    print(text, end="\n\n", flush=True)
+    return "stdout"
+
+
 class X:
     """Posts tweets with OAuth 1.0a user credentials from Secrets Manager."""
 
@@ -236,13 +286,57 @@ def handler(event, context):
                flood_threshold=int(os.environ.get("FLOOD_THRESHOLD", 50)))
 
 
+def watch(args):
+    """Run the monitor locally: a JSON file for state, stdout instead of X."""
+    store, session, seed = LocalStore(args.state), requests.Session(), args.seed
+    log.info("watching with state in %s", store.path)
+    while True:
+        try:
+            out = run(store, print_post, session, seed=seed,
+                      max_tweets=args.max_tweets,
+                      flood_threshold=args.flood_threshold)
+            log.info("pass done: %s", json.dumps(out))
+        except requests.RequestException as exc:
+            if not args.every:
+                raise
+            log.warning("fetch failed, will retry next pass: %s", exc)
+        if not args.every:
+            return
+        seed = False  # --seed applies to the first pass only
+        try:
+            time.sleep(args.every * 60)
+        except KeyboardInterrupt:
+            log.info("stopped")
+            return
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--preview", type=int, metavar="N", required=True,
-                   help="print tweet text for the N latest flights")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--preview", type=int, metavar="N",
+                      help="print tweet text for the N latest flights and exit")
+    mode.add_argument("--watch", action="store_true",
+                      help="run the monitor locally: print new flights, no X or AWS")
+    w = p.add_argument_group("--watch options")
+    w.add_argument("--state", default="nopd-flights.json", metavar="FILE",
+                   help="JSON file of flights already handled (default: %(default)s)")
+    w.add_argument("--every", type=float, default=0, metavar="MINUTES",
+                   help="keep polling at this interval instead of one pass")
+    w.add_argument("--seed", action="store_true",
+                   help="record every current flight as handled without printing")
+    w.add_argument("--max-tweets", type=int, default=10, metavar="N",
+                   help="most flights printed per pass, like MaxTweetsPerRun "
+                        "(default: %(default)s)")
+    w.add_argument("--flood-threshold", type=int, default=50, metavar="N",
+                   help="print nothing if more new flights than this appear at "
+                        "once, like FloodThreshold (default: %(default)s)")
     args = p.parse_args()
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(message)s")
 
+    if args.watch:
+        return watch(args)
     session = requests.Session()
     latest = sorted(fetch_flights(session), key=lambda a: -a["takeoff"])
     for a in latest[:args.preview]:

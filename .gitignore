@@ -2,3 +2,5 @@
 __pycache__/
 samconfig.toml
 .pytest_cache/
+.venv/
+nopd-flights.json

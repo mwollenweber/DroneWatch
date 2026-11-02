@@ -76,10 +76,31 @@ broken credentials.
 ## Local
 
 ```bash
-pip install -r src/requirements.txt boto3 pytest
+pip install -r requirements-dev.txt
 python src/app.py --preview 5     # tweet text for the 5 latest flights, no credentials needed
+python src/app.py --watch         # run the monitor itself locally, no X or AWS (see below)
 pytest
 ```
+
+### Running the monitor without X
+
+`--watch` runs the same new-flight detection as the Lambda, but keeps the
+"already handled" set in a local JSON file instead of DynamoDB and prints each
+new flight instead of tweeting it. Nothing is sent anywhere and no AWS or X
+credentials are read.
+
+```bash
+python src/app.py --watch                 # one pass; the first pass only seeds the file
+python src/app.py --watch --every 15      # keep polling every 15 minutes
+python src/app.py --watch --state ~/flights.json --max-tweets 50
+```
+
+The state file defaults to `nopd-flights.json` in the current directory. The
+seeding, flood guard and per-pass cap work exactly as deployed, with
+`--seed`, `--flood-threshold` and `--max-tweets` standing in for the
+stack parameters. Delete a flight's entry from the file to see it reported
+again on the next pass. Progress goes to stderr, so `2>/dev/null` leaves just
+the flights on stdout.
 
 ## Notes
 
