@@ -23,6 +23,13 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Log tweets instead of posting them.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email to notify when runs fail; leave empty for no alerts.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Resources:
   Flights:
@@ -81,6 +88,36 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Sub "rate(${PollMinutes} minutes)"
+
+  Alerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: !If
+        - HasAlertEmail
+        - [{Protocol: email, Endpoint: !Ref AlertEmail}]
+        - !Ref AWS::NoValue
+
+  PollerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub >-
+        The ${AWS::StackName} poller failed at least twice in an hour: a tweet
+        failed, the flood guard tripped, or the NOPD layer is unreachable. See
+        the /${AWS::StackName}/poller log group.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Poller
+      Statistic: Sum
+      # one bad poll can be a blip; two in an hour is worth an email
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
 
 Outputs:
   FunctionName:

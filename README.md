@@ -82,9 +82,11 @@ Guards against spamming:
    To see a real tweet go out, delete one flight's row from the table. The
    next run treats it as new.
 
-Logs go to the `/nopd-drone-tweets/poller` log group. If any tweet fails, the run
-ends with an error, so an alarm on the function's `Errors` metric will catch
-broken credentials.
+Logs go to the `/nopd-drone-tweets/poller` log group. A failed tweet or a
+tripped flood guard ends the run with an error. If two runs fail within an hour,
+the `PollerErrors` alarm emails `AlertEmail` (set it when deploying, e.g.
+`sam deploy --parameter-overrides AlertEmail=you@example.com`, then confirm the
+subscription email AWS sends).
 
 ## Usage
 
