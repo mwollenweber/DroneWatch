@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Poll the public NOPD drone flight layer and tweet each new flight.
+Description: Poll the public NOPD drone flight layer and tweet new flights.
 
 Parameters:
   PollMinutes:
@@ -15,9 +15,9 @@ Parameters:
     Description: Most tweets per run; extra new flights wait for the next run.
   FloodThreshold:
     Type: Number
-    Default: 50
+    Default: 200
     MinValue: 1
-    Description: If more new flights than this appear at once, tweet nothing and log an error.
+    Description: If more new flights than this appear at once, tweet nothing and fail the run.
   DryRun:
     Type: String
     Default: "false"

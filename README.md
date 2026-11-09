@@ -1,7 +1,8 @@
 # NOPD drone flight tweeter
 
 An AWS Lambda that polls NOPD's public Skydio/ArcGIS drone flight layer every
-few minutes and posts one tweet for each new flight.
+few minutes and tweets new flights: one tweet per flight when 1–3 show up, or a
+single summary tweet when a bigger batch is uploaded.
 
 ```
 NOPD drone flight: Tactical Operations
@@ -26,12 +27,24 @@ link, because the full paths add up to more than 100 MB.
 Guards against spamming:
 
 - **First run** (empty table) records every existing flight and posts nothing.
-- **Flood guard**: if more than `FloodThreshold` (default 50) new flights appear
+- **Batches**: more than 3 new flights in one run go out as one tweet with the
+  flight count, the dates they were flown, when NOPD logged them (the layer's
+  last data edit) and how long after the flights that was, the purpose mix,
+  and a link to the layer on an ArcGIS map:
+
+  ```
+  NOPD logged 63 drone flights at once
+  Flown Oct 20–26, 2026
+  Logged Thu Nov 5, 1:58 PM, 10–16 days later
+  45 Call for Service, 6 Training, 4 Tactical Operations, 4 Special Event, 4 no purpose given
+  Data: https://www.arcgis.com/apps/mapviewer/index.html?layers=918de1931f864bf3a0c10dd6b00499e9
+  ```
+- **Flood guard**: if more than `FloodThreshold` (default 200) new flights appear
   at once, which usually means the layer was rebuilt with new IDs, it posts
-  nothing and logs an error. Invoke with `{"seed": true}` to accept them.
-- **Per-run cap**: at most `MaxTweetsPerRun` (default 10). The rest go out on
-  later runs. An X rate limit (429) also stops the run and leaves the rest for
-  later.
+  nothing and fails the run. Invoke with `{"seed": true}` to accept them.
+- **Per-run cap**: at most `MaxTweetsPerRun` (default 10) single-flight tweets.
+  The rest go out on later runs. An X rate limit (429) also stops the run and
+  leaves the rest for later.
 - A flight is recorded only **after** its tweet succeeds, so failures are
   retried on the next run. If X rejects a tweet as a duplicate, the flight is
   recorded as already posted.
