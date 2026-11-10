@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-AWS Lambda: poll the public NOPD drone flight layer and tweet each new flight.
+AWS Lambda: poll the public NOPD drone flight layer and tweet new flights.
 
 Flights are uploaded in batches days after they fly, and ObjectIds are not in
 takeoff order, so "new" means "a flight_id not seen before", not "took off
 since the last poll". Each run fetches every flight (attributes only, ~150 KB),
 diffs against a DynamoDB table of flights already handled, and tweets the new
-ones oldest first.
+ones: up to GROUP_OVER of them one tweet each, oldest first; more than that as
+one tweet summarizing the batch.
 
   - Empty table (first run): record every existing flight, tweet nothing.
-  - More than FLOOD_THRESHOLD new at once: tweet nothing, log an error. That
+  - More than FLOOD_THRESHOLD new at once: tweet nothing and fail the run. That
     usually means the layer was rebuilt; invoke with {"seed": true} to accept.
   - At most MAX_TWEETS_PER_RUN per run; the rest wait for the next run.
   - A flight is recorded only after its tweet succeeds, so failures retry.
@@ -27,7 +28,8 @@ python app.py --watch --every 15
 Copyright 2026 mjw@insomniac.tech
 """
 
-import argparse, json, logging, math, os, sys, time
+import argparse, json, logging, math, os, re, sys, time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -42,6 +44,11 @@ log.setLevel(logging.INFO)
 TWEET_URL = "https://api.x.com/2/tweets"
 EPOCH = datetime(2000, 1, 1)
 DESC_MAX = 80
+GROUP_OVER = 3  # more new flights than this go out as one batch tweet
+LAYER = BASE.removesuffix("/query")
+DATA_URL = ("https://www.arcgis.com/apps/mapviewer/index.html"
+            "?layers=918de1931f864bf3a0c10dd6b00499e9")
+TWEET_MAX, URL_LEN = 280, 23  # X counts every link as 23 characters
 
 
 class RateLimited(Exception):
@@ -77,8 +84,79 @@ def flight_center(object_id, session):
     return (lat, lon) if math.isfinite(lat) and math.isfinite(lon) else None
 
 
+def layer_edited(session):
+    """When NOPD last changed the layer's data, as local time, or None.
+
+    ArcGIS bumps this when a batch of flights is uploaded, so it stands in for
+    "when these flights were logged".
+    """
+    try:
+        r = session.get(LAYER, params={"f": "json"}, timeout=30)
+        r.raise_for_status()
+        ms = r.json()["editingInfo"]["dataLastEditDate"]
+        return datetime.fromtimestamp(ms / 1000, LOCAL)
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        log.warning("no layer edit date: %s", exc)
+        return None
+
+
 def clock(t):
     return t.strftime("%I:%M %p").lstrip("0")
+
+
+def day_range(d0, d1):
+    """"Oct 20–26, 2026", "Sep 28 – Oct 3, 2026", or "Oct 20, 2026"."""
+    if d0 == d1:
+        return f"{d0:%b} {d0.day}, {d0.year}"
+    if d0.year != d1.year:
+        return f"{d0:%b} {d0.day}, {d0.year} – {d1:%b} {d1.day}, {d1.year}"
+    if d0.month != d1.month:
+        return f"{d0:%b} {d0.day} – {d1:%b} {d1.day}, {d1.year}"
+    return f"{d0:%b} {d0.day}–{d1.day}, {d1.year}"
+
+
+def days_later(n0, n1):
+    """Gap from flights to upload: "10–16 days later", "1 day later", "same day"."""
+    if n1 <= 0:
+        return "same day"
+    if n0 == n1:
+        return f"{n1} day{'s' if n1 != 1 else ''} later"
+    return f"{max(n0, 0)}–{n1} days later"
+
+
+def tweet_len(text):
+    return len(re.sub(r"https?://\S+", "x" * URL_LEN, text))
+
+
+def compose_group(flights, logged=None):
+    """One tweet summarizing a batch of new flights.
+
+    logged is when the batch hit the layer (layer_edited); None means now.
+    """
+    logged = logged or datetime.now(LOCAL)
+    days = sorted(datetime.fromtimestamp(a["takeoff"] / 1000, LOCAL).date()
+                  for a in flights)
+    first, last = days[0], days[-1]
+    gap = days_later((logged.date() - last).days, (logged.date() - first).days)
+
+    purposes = Counter(a.get("flight_purpose") or "" for a in flights)
+    mix = [f"{n} {p or 'no purpose given'}" for p, n in
+           sorted(purposes.items(), key=lambda pn: (-pn[1], not pn[0]))]
+
+    lines = [f"NOPD logged {len(flights)} drone flights at once",
+             f"Flown {day_range(first, last)}",
+             f"Logged {logged:%a %b} {logged.day}, {clock(logged)}, {gap}",
+             None,
+             f"Data: {DATA_URL}"]
+    # drop the smallest purposes until the tweet fits
+    while mix:
+        lines[3] = ", ".join(mix)
+        if tweet_len("\n".join(lines)) <= TWEET_MAX:
+            break
+        mix.pop()
+        if mix:
+            mix[-1] += ", …"
+    return "\n".join(l for l in lines if l)
 
 
 def compose(a, center=None):
@@ -131,10 +209,10 @@ class Store:
     def record(self, a, status, tweet_id=None):
         self.table.put_item(Item=_item(a, status, tweet_id))
 
-    def record_all(self, flights, status):
+    def record_all(self, flights, status, tweet_id=None):
         with self.table.batch_writer(overwrite_by_pkeys=["flight_id"]) as b:
             for a in flights:
-                b.put_item(Item=_item(a, status))
+                b.put_item(Item=_item(a, status, tweet_id))
 
 
 def _item(a, status, tweet_id=None):
@@ -169,9 +247,9 @@ class LocalStore:
         self.items[a["flight_id"]] = _item(a, status, tweet_id)
         self._save()
 
-    def record_all(self, flights, status):
+    def record_all(self, flights, status, tweet_id=None):
         for a in flights:
-            self.items[a["flight_id"]] = _item(a, status)
+            self.items[a["flight_id"]] = _item(a, status, tweet_id)
         self._save()
 
     def _save(self):
@@ -200,14 +278,15 @@ def flight_details(a, center=None, text=None):
     return d
 
 
-def print_post(text, flight=None, center=None):
+def print_post(text, flight=None, center=None, flights=None):
     """Stand-in for X.post in --watch: prints the flight as JSON, sends nothing.
 
-    Returns "stdout" where X.post returns a tweet id, so the record says where
-    the flight went.
+    A batch tweet prints as {"tweet": ..., "flights": [...]}. Returns "stdout"
+    where X.post returns a tweet id, so the record says where the flight went.
     """
-    print(json.dumps(flight_details(flight, center, text), indent=2,
-                     ensure_ascii=False), flush=True)
+    d = ({"tweet": text, "flights": [flight_details(a) for a in flights]}
+         if flights else flight_details(flight, center, text))
+    print(json.dumps(d, indent=2, ensure_ascii=False), flush=True)
     return "stdout"
 
 
@@ -227,8 +306,8 @@ class X:
                                 c["access_token"], c["access_token_secret"])
         return self._auth
 
-    def post(self, text, flight=None, center=None):
-        # flight and center are for print_post; X only needs the text
+    def post(self, text, flight=None, center=None, flights=None):
+        # flight, center and flights are for print_post; X only needs the text
         r = self.session.post(TWEET_URL, json={"text": text}, auth=self.auth(),
                               timeout=30)
         if r.status_code == 429:
@@ -241,7 +320,7 @@ class X:
 
 
 def run(store, post, session, *, seed=False, dry_run=False,
-        max_tweets=10, flood_threshold=50):
+        max_tweets=10, flood_threshold=200):
     flights = fetch_flights(session)
     seen = store.seen()
     new = sorted((a for a in flights if a["flight_id"] not in seen),
@@ -255,10 +334,13 @@ def run(store, post, session, *, seed=False, dry_run=False,
         return {**summary, "seeded": len(new)}
 
     if len(new) > flood_threshold:
-        log.error('%d new flights exceeds FLOOD_THRESHOLD=%d; not tweeting. '
-                  'Invoke with {"seed": true} to record them as seen.',
-                  len(new), flood_threshold)
-        return {**summary, "flood": True}
+        # raise, not return, so it shows in the Lambda Errors metric
+        raise RuntimeError(f'{len(new)} new flights exceeds FLOOD_THRESHOLD='
+                           f'{flood_threshold}; not tweeting. Invoke with '
+                           '{"seed": true} to record them as seen.')
+
+    if len(new) > GROUP_OVER:
+        return post_group(store, post, session, new, summary, dry_run)
 
     for i, a in enumerate(new[:max_tweets]):
         center = flight_center(a["ObjectId"], session)
@@ -296,6 +378,29 @@ def run(store, post, session, *, seed=False, dry_run=False,
     return summary
 
 
+def post_group(store, post, session, new, summary, dry_run):
+    """Tweet a batch of new flights as one summary and record them all."""
+    text = compose_group(new, layer_edited(session))
+    if dry_run:
+        log.info("DRY RUN, would tweet %d flights as one:\n%s", len(new), text)
+        return summary
+    try:
+        tweet_id = post(text, flights=new)
+    except RateLimited as exc:
+        log.warning("rate limited (%s); %d flights left for the next run",
+                    exc, len(new))
+        return summary
+    except Duplicate as exc:
+        log.warning("X says the batch tweet is a duplicate, recording it: %s", exc)
+        store.record_all(new, "duplicate")
+        return summary
+    store.record_all(new, "grouped", tweet_id)
+    log.info("tweeted %d flights as %s", len(new), tweet_id)
+    summary = {**summary, "tweeted": 1, "grouped": len(new)}
+    log.info("summary %s", json.dumps(summary))
+    return summary
+
+
 def handler(event, context):
     event = event if isinstance(event, dict) else {}
     session = requests.Session()
@@ -305,7 +410,7 @@ def handler(event, context):
                dry_run=bool(event.get("dry_run"))
                        or os.environ.get("DRY_RUN", "").lower() == "true",
                max_tweets=int(os.environ.get("MAX_TWEETS_PER_RUN", 10)),
-               flood_threshold=int(os.environ.get("FLOOD_THRESHOLD", 50)))
+               flood_threshold=int(os.environ.get("FLOOD_THRESHOLD", 200)))
 
 
 def watch(args):
@@ -350,7 +455,7 @@ def main():
     w.add_argument("--max-tweets", type=int, default=10, metavar="N",
                    help="most flights printed per pass, like MaxTweetsPerRun "
                         "(default: %(default)s)")
-    w.add_argument("--flood-threshold", type=int, default=50, metavar="N",
+    w.add_argument("--flood-threshold", type=int, default=200, metavar="N",
                    help="print nothing if more new flights than this appear at "
                         "once, like FloodThreshold (default: %(default)s)")
     args = p.parse_args()

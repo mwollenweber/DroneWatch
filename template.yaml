@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Poll the public NOPD drone flight layer and tweet each new flight.
+Description: Poll the public NOPD drone flight layer and tweet new flights.
 
 Parameters:
   PollMinutes:
@@ -15,14 +15,21 @@ Parameters:
     Description: Most tweets per run; extra new flights wait for the next run.
   FloodThreshold:
     Type: Number
-    Default: 50
+    Default: 200
     MinValue: 1
-    Description: If more new flights than this appear at once, tweet nothing and log an error.
+    Description: If more new flights than this appear at once, tweet nothing and fail the run.
   DryRun:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Log tweets instead of posting them.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email to notify when runs fail; leave empty for no alerts.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Resources:
   Flights:
@@ -81,6 +88,36 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Sub "rate(${PollMinutes} minutes)"
+
+  Alerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: !If
+        - HasAlertEmail
+        - [{Protocol: email, Endpoint: !Ref AlertEmail}]
+        - !Ref AWS::NoValue
+
+  PollerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub >-
+        The ${AWS::StackName} poller failed at least twice in an hour: a tweet
+        failed, the flood guard tripped, or the NOPD layer is unreachable. See
+        the /${AWS::StackName}/poller log group.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Poller
+      Statistic: Sum
+      # one bad poll can be a blip; two in an hour is worth an email
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
 
 Outputs:
   FunctionName:

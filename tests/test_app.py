@@ -25,16 +25,16 @@ class FakeStore:
         self.ids.add(a["flight_id"])
         self.records.append((a["flight_id"], status, tweet_id))
 
-    def record_all(self, flights, status):
+    def record_all(self, flights, status, tweet_id=None):
         for a in flights:
-            self.record(a, status)
+            self.record(a, status, tweet_id)
 
 
 class FakeX:
     def __init__(self, fail=()):
         self.posts, self.fail = [], dict(fail)
 
-    def __call__(self, text, flight=None, center=None):
+    def __call__(self, text, flight=None, center=None, flights=None):
         n = len(self.posts)
         if n in self.fail:
             self.posts.append(None)
@@ -48,7 +48,11 @@ def flights(monkeypatch):
     data = []
     monkeypatch.setattr(app, "fetch_flights", lambda s: list(data))
     monkeypatch.setattr(app, "flight_center", lambda oid, s: (29.95578, -90.01415))
+    monkeypatch.setattr(app, "layer_edited", lambda s: LOGGED)
     return data
+
+
+LOGGED = app.datetime(2026, 9, 26, 13, 58, tzinfo=app.LOCAL)
 
 
 def test_first_run_seeds_without_tweeting(flights):
@@ -70,18 +74,57 @@ def test_new_flights_tweeted_oldest_first(flights):
 
 
 def test_cap_leaves_rest_for_next_run(flights):
-    flights += [flight(n) for n in range(1, 6)]
+    flights += [flight(n) for n in range(1, 5)]
     store = FakeStore({"f1"})
     assert app.run(store, FakeX(), None, max_tweets=2)["tweeted"] == 2
-    assert app.run(store, FakeX(), None, max_tweets=2)["tweeted"] == 2
-    assert store.ids == {f"f{n}" for n in range(1, 6)}
+    assert app.run(store, FakeX(), None, max_tweets=2)["tweeted"] == 1
+    assert store.ids == {f"f{n}" for n in range(1, 5)}
 
 
-def test_flood_guard_tweets_nothing(flights):
+def test_three_new_flights_tweet_individually(flights):
+    flights += [flight(n) for n in range(1, 5)]
+    store, x = FakeStore({"f1"}), FakeX()
+    assert app.run(store, x, None)["tweeted"] == 3
+    assert all(p.startswith("NOPD drone flight:") for p in x.posts)
+
+
+def test_four_new_flights_tweet_as_one_group(flights):
+    flights += [flight(n) for n in range(1, 6)]
+    store, x = FakeStore({"f1"}), FakeX()
+    out = app.run(store, x, None, max_tweets=2)  # the cap doesn't split a group
+    assert out["tweeted"] == 1 and out["grouped"] == 4
+    assert x.posts == [app.compose_group([flight(n) for n in range(2, 6)], LOGGED)]
+    assert store.records == [(f"f{n}", "grouped", "t0") for n in range(2, 6)]
+
+
+def test_group_failure_records_nothing(flights):
+    flights += [flight(n) for n in range(1, 6)]
+    store = FakeStore({"f1"})
+    with pytest.raises(RuntimeError, match="X API 500"):
+        app.run(store, FakeX(fail={0: RuntimeError("X API 500")}), None)
+    assert store.records == []
+
+
+def test_group_rate_limit_waits(flights):
+    flights += [flight(n) for n in range(1, 6)]
+    store = FakeStore({"f1"})
+    app.run(store, FakeX(fail={0: app.RateLimited("resets at 0")}), None)
+    assert store.records == []
+
+
+def test_group_dry_run(flights):
+    flights += [flight(n) for n in range(1, 6)]
+    store, x = FakeStore({"f1"}), FakeX()
+    app.run(store, x, None, dry_run=True)
+    assert x.posts == [] and store.records == []
+
+
+def test_flood_guard_fails_and_tweets_nothing(flights):
     flights += [flight(n) for n in range(1, 10)]
     store, x = FakeStore({"f1"}), FakeX()
-    out = app.run(store, x, None, flood_threshold=5)
-    assert out["flood"] and x.posts == [] and store.records == []
+    with pytest.raises(RuntimeError, match="FLOOD_THRESHOLD=5"):
+        app.run(store, x, None, flood_threshold=5)
+    assert x.posts == [] and store.records == []
     app.run(store, x, None, seed=True, flood_threshold=5)
     assert x.posts == [] and len(store.ids) == 9
 
@@ -138,6 +181,46 @@ def test_compose_crosses_midnight_and_sparse_fields():
     assert len(lines) == 3
 
 
+DAY = 86400000
+
+
+def test_compose_group():
+    batch = [flight(1, takeoff=T0 - 6 * DAY), flight(2, flight_purpose="Training"),
+             flight(3, flight_purpose=None), flight(4)]
+    assert app.compose_group(batch, LOGGED) == (
+        "NOPD logged 4 drone flights at once\n"
+        "Flown Sep 10–16, 2026\n"
+        "Logged Sat Sep 26, 1:58 PM, 10–16 days later\n"
+        "2 Tactical Operations, 1 Training, 1 no purpose given\n"
+        f"Data: {app.DATA_URL}")
+
+
+def test_compose_group_trims_purposes_to_fit():
+    batch = [flight(n, flight_purpose=f"Purpose number {n} " + "x" * 20)
+             for n in range(20)]
+    text = app.compose_group(batch, LOGGED)
+    assert app.tweet_len(text) <= 280 and ", …\n" in text
+    assert text.endswith(app.DATA_URL)
+
+
+@pytest.mark.parametrize("d0, d1, want", [
+    ((2026, 10, 20), (2026, 10, 26), "Oct 20–26, 2026"),
+    ((2026, 9, 28), (2026, 10, 3), "Sep 28 – Oct 3, 2026"),
+    ((2025, 12, 30), (2026, 1, 2), "Dec 30, 2025 – Jan 2, 2026"),
+    ((2026, 10, 20), (2026, 10, 20), "Oct 20, 2026"),
+])
+def test_day_range(d0, d1, want):
+    assert app.day_range(app.datetime(*d0).date(), app.datetime(*d1).date()) == want
+
+
+@pytest.mark.parametrize("n0, n1, want", [
+    (10, 16, "10–16 days later"), (3, 3, "3 days later"), (1, 1, "1 day later"),
+    (0, 2, "0–2 days later"), (0, 0, "same day"),
+])
+def test_days_later(n0, n1, want):
+    assert app.days_later(n0, n1) == want
+
+
 def test_local_store_persists_like_the_table(tmp_path):
     path = tmp_path / "flights.json"
     store = app.LocalStore(path)
@@ -178,6 +261,18 @@ def test_watch_prints_new_flights_as_json_and_records_them(flights, tmp_path, ca
     assert (d["lat"], d["lon"]) == (29.95578, -90.01415)
     assert d["tweet"] == app.compose(flight(3), (29.95578, -90.01415))
     assert app.LocalStore(path).seen() == {"f1", "f2", "f3"}
+
+
+def test_watch_prints_a_group_as_one_json_object(flights, tmp_path, capsys):
+    path = tmp_path / "flights.json"
+    flights += [flight(1)]
+    app.run(app.LocalStore(path), app.print_post, None)
+    flights += [flight(n) for n in range(2, 6)]
+    app.run(app.LocalStore(path), app.print_post, None)
+    d = json.loads(capsys.readouterr().out)
+    assert d["tweet"].startswith("NOPD logged 4 drone flights")
+    assert [f["flight_id"] for f in d["flights"]] == ["f2", "f3", "f4", "f5"]
+    assert app.LocalStore(path).items["f5"]["status"] == "grouped"
 
 
 def test_flight_details_sparse():
